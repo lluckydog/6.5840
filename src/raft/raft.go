@@ -161,17 +161,7 @@ func (rf *Raft) getPersistState() []byte {
 }
 
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
 
-	//e.Encode(rf.l)
-	//e.Encode(rf.lastIncludedIndex)
 	rf.persister.Save(rf.getPersistState(), rf.getSnapshot())
 }
 
@@ -181,19 +171,6 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var term int
@@ -239,7 +216,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.setNewTerm(args.Term)
 		reply.Term = rf.currentTerm
 		rf.persist()
-		//rf.resetElectionTimer()
 	}
 
 	if args.LastLogTerm < rf.logs[len(rf.logs)-1].Term ||
@@ -252,8 +228,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.voteFor = args.CandidateID
 		reply.VoteGranted = true
 		DPrintf("[%v]: vote for %v, Term %v", rf.me, args.CandidateID, args.Term)
-		rf.persist()
 		rf.resetElectionTimer()
+		rf.persist()
 	}
 
 }
@@ -318,10 +294,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 		rf.logs = append(rf.logs, entry)
 		rf.persist()
-		rf.startAppendEntries()
 	}
 
-	return index, term, rf.currenState == LEADER
+	return index, term, isLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -394,18 +369,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	reply.Success = true
-	//如果一个outdate消息，可能会导致entries被trune，不是最新的，这边有问题
-	//if len(args.Entries) != 0 && ((len(rf.logs) > args.Entries[len(args.Entries)-1].Index && rf.logs[args.Entries[len(args.Entries)-1].Index].Term != args.Entries[len(args.Entries)-1].Term) || (len(rf.logs) <= args.Entries[len(args.Entries)-1].Index)) {
-	//	rf.logs = rf.logs[:args.Entries[0].Index]
-	//	rf.logs = append(rf.logs, args.Entries...)
-	//	rf.persist()
-	//}
-
-	//if len(args.Entries) != 0 && !(len(rf.logs) > args.Entries[len(args.Entries)-1].Index && rf.logs[args.Entries[len(args.Entries)-1].Index].Term == args.Entries[len(args.Entries)-1].Term) {
-	//	rf.logs = rf.logs[:args.Entries[0].Index]
-	//	rf.logs = append(rf.logs, args.Entries...)
-	//	rf.persist()
-	//}
 
 	for i, entry := range args.Entries {
 		if entry.Index <= rf.logs[len(rf.logs)-1].Index && rf.logs[entry.Index].Term != entry.Term {
@@ -420,25 +383,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
-	//if len(args.Entries) != 0 {
-	//	rf.logs = append(rf.logs, args.Entries...)
-	//	rf.persist()
-	//}
-
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = args.LeaderCommit
-		//for i := rf.commitIndex + 1; i <= args.LeaderCommit; i++ {
-		//	DPrintf("[%v]: follower start to appendEntries, Command %v", rf.me, rf.logs[i])
-		//	rf.commitIndex = i
-		//
-		//	msg := ApplyMsg{
-		//		Command:      rf.logs[i].Command,
-		//		CommandValid: true,
-		//		CommandIndex: i,
-		//	}
-		//	rf.applyChan <- msg
-		//	rf.lastApplied = i
-		//}
 		rf.commitChan <- args.LeaderCommit
 	}
 }
@@ -480,35 +426,27 @@ func (rf *Raft) startAppendEntries() {
 					if args.Term == rf.currentTerm && rf.currenState == LEADER {
 						if reply.Success {
 							DPrintf("[%v]: appendEntries success from %v", rf.me, i)
-							if len(args.Entries) == 0 {
-								rf.matchIndex[i] = args.PrevLogIndex
-								rf.nextIndex[i] = args.PrevLogIndex + 1
-							} else {
+							if len(args.Entries) > 0 {
 								rf.matchIndex[i] = args.Entries[len(args.Entries)-1].Index
 								rf.nextIndex[i] = args.Entries[len(args.Entries)-1].Index + 1
 							}
-							cnt := 0
-							for j := 0; j < len(rf.peers); j++ {
-								if rf.matchIndex[j] > rf.commitIndex {
-									cnt++
+							for N := rf.logs[len(rf.logs)-1].Index; N > rf.commitIndex && rf.logs[N].Term == rf.currentTerm; N-- {
+								cnt := 0
+								for j := 0; j < len(rf.peers); j++ {
+									if j != rf.me && rf.matchIndex[j] >= N {
+										cnt++
+									}
+								}
+								if cnt >= len(rf.peers)/2 {
+									once.Do(func() {
+										DPrintf("[%v]: leader start to commit to applychan, log %v", rf.me, rf.logs[rf.commitIndex+1])
+										rf.commitIndex = N
+										rf.commitChan <- rf.commitIndex
+									})
+									break
 								}
 							}
 
-							if cnt >= len(rf.peers)/2 {
-								once.Do(func() {
-
-									DPrintf("[%v]: leader start to commit to applychan, log %v", rf.me, rf.logs[rf.commitIndex+1])
-									rf.commitIndex++
-									rf.commitChan <- rf.commitIndex
-									//msg := ApplyMsg{
-									//	Command:      rf.logs[rf.commitIndex].Command,
-									//	CommandValid: true,
-									//	CommandIndex: rf.commitIndex,
-									//}
-									//rf.applyChan <- msg
-									//rf.lastApplied = rf.commitIndex
-								})
-							}
 						} else {
 							if reply.XTerm != -1 {
 
