@@ -79,11 +79,11 @@ type Raft struct {
 	lastApplied int
 	currenState STATE
 	electTime   time.Time
-	electChan   chan int
-	appendChan  chan int
-	applyChan   chan ApplyMsg
-	nextIndex   []int
-	matchIndex  []int
+
+	commitChan chan int
+	applyChan  chan ApplyMsg
+	nextIndex  []int
+	matchIndex []int
 }
 
 type Log struct {
@@ -345,7 +345,7 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) resetElectionTimer() {
 	t := time.Now()
-	electionTimeout := time.Duration(200+rand.Intn(150)) * time.Millisecond
+	electionTimeout := time.Duration(150+rand.Intn(150)) * time.Millisecond
 	rf.electTime = t.Add(electionTimeout)
 }
 
@@ -367,53 +367,79 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.setNewTerm(args.Term)
 		reply.Term = rf.currentTerm
 		rf.persist()
+		//return
 	}
 
 	if rf.currenState == CANDIATE {
 		rf.currenState = FOLLOWER
 	}
 	rf.resetElectionTimer()
-	if len(rf.logs) <= args.PrevLogIndex || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-		if len(rf.logs) <= args.PrevLogIndex {
-			DPrintf("[%v]: append Error for reason 1, my lastlogs %v, index %v", rf.me, rf.logs[len(rf.logs)-1], args.PrevLogIndex)
-			reply.XLen = len(rf.logs)
-		} else {
-			DPrintf("[%v]: append Error for reason 2", rf.me)
+	if len(rf.logs) <= args.PrevLogIndex {
+		DPrintf("[%v]: append Error for reason 1, my lastlogs %v, index %v", rf.me, rf.logs[len(rf.logs)-1], args.PrevLogIndex)
 
-			reply.XTerm = rf.logs[args.PrevLogIndex].Term
-			reply.XLen = len(rf.logs)
-
-			for index := args.PrevLogIndex - 1; index >= 0; index-- {
-				if rf.logs[args.PrevLogIndex].Term != rf.logs[index].Term {
-					reply.XIndex = index
-					break
-				}
-			}
-		}
-
+		reply.XLen = len(rf.logs)
 		return
 	}
-	reply.Success = true
-	if len(args.Entries) != 0 && len(rf.logs) > args.Entries[0].Index {
-		rf.logs = rf.logs[:args.Entries[0].Index]
+
+	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.XTerm = rf.logs[args.PrevLogIndex].Term
+		reply.XIndex = args.PrevLogIndex
+		for index := args.PrevLogIndex - 1; index >= 0; index-- {
+			if rf.logs[args.PrevLogIndex].Term != rf.logs[index].Term {
+				reply.XIndex = index
+				break
+			}
+		}
+		return
 	}
 
-	rf.logs = append(rf.logs, args.Entries...)
-	rf.persist()
+	reply.Success = true
+	//如果一个outdate消息，可能会导致entries被trune，不是最新的，这边有问题
+	//if len(args.Entries) != 0 && ((len(rf.logs) > args.Entries[len(args.Entries)-1].Index && rf.logs[args.Entries[len(args.Entries)-1].Index].Term != args.Entries[len(args.Entries)-1].Term) || (len(rf.logs) <= args.Entries[len(args.Entries)-1].Index)) {
+	//	rf.logs = rf.logs[:args.Entries[0].Index]
+	//	rf.logs = append(rf.logs, args.Entries...)
+	//	rf.persist()
+	//}
+
+	//if len(args.Entries) != 0 && !(len(rf.logs) > args.Entries[len(args.Entries)-1].Index && rf.logs[args.Entries[len(args.Entries)-1].Index].Term == args.Entries[len(args.Entries)-1].Term) {
+	//	rf.logs = rf.logs[:args.Entries[0].Index]
+	//	rf.logs = append(rf.logs, args.Entries...)
+	//	rf.persist()
+	//}
+
+	for i, entry := range args.Entries {
+		if entry.Index <= rf.logs[len(rf.logs)-1].Index && rf.logs[entry.Index].Term != entry.Term {
+			rf.logs = rf.logs[:entry.Index]
+			rf.persist()
+		}
+
+		if len(rf.logs) <= 1 || entry.Index > rf.logs[len(rf.logs)-1].Index {
+			rf.logs = append(rf.logs, args.Entries[i:]...)
+			rf.persist()
+			break
+		}
+	}
+
+	//if len(args.Entries) != 0 {
+	//	rf.logs = append(rf.logs, args.Entries...)
+	//	rf.persist()
+	//}
 
 	if args.LeaderCommit > rf.commitIndex {
-		for i := rf.commitIndex + 1; i <= args.LeaderCommit; i++ {
-			DPrintf("[%v]: follower start to appendEntries, Command %v", rf.me, rf.logs[i])
-			rf.commitIndex = i
-
-			msg := ApplyMsg{
-				Command:      rf.logs[i].Command,
-				CommandValid: true,
-				CommandIndex: i,
-			}
-			rf.applyChan <- msg
-			rf.lastApplied = i
-		}
+		rf.commitIndex = args.LeaderCommit
+		//for i := rf.commitIndex + 1; i <= args.LeaderCommit; i++ {
+		//	DPrintf("[%v]: follower start to appendEntries, Command %v", rf.me, rf.logs[i])
+		//	rf.commitIndex = i
+		//
+		//	msg := ApplyMsg{
+		//		Command:      rf.logs[i].Command,
+		//		CommandValid: true,
+		//		CommandIndex: i,
+		//	}
+		//	rf.applyChan <- msg
+		//	rf.lastApplied = i
+		//}
+		rf.commitChan <- args.LeaderCommit
 	}
 }
 
@@ -423,7 +449,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 func (rf *Raft) startAppendEntries() {
-	rf.resetElectionTimer()
 	DPrintf("[%v]: start appendEntries in Term %v", rf.me, rf.currentTerm)
 	once := &sync.Once{}
 	for i := 0; i < len(rf.peers); i++ {
@@ -436,72 +461,87 @@ func (rf *Raft) startAppendEntries() {
 				Entries:      rf.logs[rf.nextIndex[i]:],
 				LeaderCommit: rf.commitIndex,
 			}
+
 			go func(i int, arg *AppendEntriesArgs) {
+
 				var reply AppendEntriesReply
-				rf.sendAppendEntries(i, arg, &reply)
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
+				ok := rf.sendAppendEntries(i, arg, &reply)
 
-				if reply.Term > rf.currentTerm {
-					rf.setNewTerm(reply.Term)
-					rf.persist()
-					return
-				}
-				if args.Term == rf.currentTerm {
-					if reply.Success {
-						DPrintf("[%v]: appendEntries success from %v", rf.me, i)
-						if len(args.Entries) == 0 {
-							rf.matchIndex[i] = args.PrevLogIndex
-							rf.nextIndex[i] = args.PrevLogIndex + 1
-						} else {
-							rf.matchIndex[i] = args.Entries[len(args.Entries)-1].Index
-							rf.nextIndex[i] = args.Entries[len(args.Entries)-1].Index + 1
-						}
-						cnt := 0
-						for j := 0; j < len(rf.peers); j++ {
-							if rf.matchIndex[j] > rf.commitIndex {
-								cnt++
-							}
-						}
+				if ok {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
 
-						if cnt >= len(rf.peers)/2 {
-							once.Do(func() {
-								DPrintf("[%v]: leader start to commit to applychan, log %v", rf.me, rf.logs[rf.commitIndex+1])
-								rf.commitIndex++
-								msg := ApplyMsg{
-									Command:      rf.logs[rf.commitIndex].Command,
-									CommandValid: true,
-									CommandIndex: rf.commitIndex,
-								}
-								rf.applyChan <- msg
-								rf.lastApplied = rf.commitIndex
-							})
-						}
-					} else {
-						if reply.XTerm != -1 {
-							if rf.logs[reply.XIndex].Term != reply.XTerm {
-								rf.nextIndex[i] = reply.XIndex
-								if reply.XIndex > 0 {
-									rf.matchIndex[i] = reply.XIndex - 1
-								}
+					if reply.Term > rf.currentTerm {
+						rf.setNewTerm(reply.Term)
+						rf.persist()
+						return
+					}
+
+					if args.Term == rf.currentTerm && rf.currenState == LEADER {
+						if reply.Success {
+							DPrintf("[%v]: appendEntries success from %v", rf.me, i)
+							if len(args.Entries) == 0 {
+								rf.matchIndex[i] = args.PrevLogIndex
+								rf.nextIndex[i] = args.PrevLogIndex + 1
 							} else {
-								for index := len(rf.logs) - 1; index >= 0; index-- {
+								rf.matchIndex[i] = args.Entries[len(args.Entries)-1].Index
+								rf.nextIndex[i] = args.Entries[len(args.Entries)-1].Index + 1
+							}
+							cnt := 0
+							for j := 0; j < len(rf.peers); j++ {
+								if rf.matchIndex[j] > rf.commitIndex {
+									cnt++
+								}
+							}
+
+							if cnt >= len(rf.peers)/2 {
+								once.Do(func() {
+
+									DPrintf("[%v]: leader start to commit to applychan, log %v", rf.me, rf.logs[rf.commitIndex+1])
+									rf.commitIndex++
+									rf.commitChan <- rf.commitIndex
+									//msg := ApplyMsg{
+									//	Command:      rf.logs[rf.commitIndex].Command,
+									//	CommandValid: true,
+									//	CommandIndex: rf.commitIndex,
+									//}
+									//rf.applyChan <- msg
+									//rf.lastApplied = rf.commitIndex
+								})
+							}
+						} else {
+							if reply.XTerm != -1 {
+
+								found := false
+								DPrintf("[%v]: conflict 2 %v", rf.me, reply)
+								for index := args.PrevLogIndex; index >= 0; index-- {
 									if rf.logs[index].Term == reply.XTerm {
 										rf.nextIndex[i] = index
+										found = true
 										if index > 0 {
 											rf.matchIndex[i] = index - 1
 										}
 										break
+									} else if rf.logs[index].Term < reply.XTerm {
+										break
+									}
+								}
+								if !found {
+									rf.nextIndex[i] = reply.XIndex
+									if reply.XIndex > 0 {
+										rf.matchIndex[i] = reply.XIndex - 1
 									}
 								}
 
-							}
-						} else {
-							if reply.XLen > 0 {
-								rf.matchIndex[i] = reply.XLen - 1
-							}
+							} else {
+								DPrintf("[%v]: conflict 3 %v", rf.me, reply)
 
-							rf.nextIndex[i] = reply.XLen
+								if reply.XLen > 0 {
+									rf.matchIndex[i] = reply.XLen - 1
+								}
+
+								rf.nextIndex[i] = reply.XLen
+							}
 						}
 					}
 				}
@@ -568,6 +608,7 @@ func (rf *Raft) ticker() {
 		}
 
 		if rf.currenState == LEADER {
+			rf.resetElectionTimer()
 			rf.startAppendEntries()
 		}
 
@@ -575,6 +616,23 @@ func (rf *Raft) ticker() {
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		time.Sleep(heartBeat)
+	}
+}
+
+func (rf *Raft) applier() {
+	for commit := range rf.commitChan {
+		for i := rf.lastApplied + 1; i <= commit; i++ {
+			DPrintf("[%v]: follower start to appendEntries, Command %v", rf.me, rf.logs[i])
+			rf.commitIndex = i
+
+			msg := ApplyMsg{
+				Command:      rf.logs[i].Command,
+				CommandValid: true,
+				CommandIndex: i,
+			}
+			rf.applyChan <- msg
+			rf.lastApplied = i
+		}
 	}
 }
 
@@ -597,8 +655,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.voteFor = -1
 	rf.currenState = FOLLOWER
 	rf.resetElectionTimer()
-	rf.electChan = make(chan int, 2)
-	rf.appendChan = make(chan int, 2)
+	rf.commitChan = make(chan int, 100)
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.applyChan = applyCh
@@ -620,6 +677,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.applier()
 
 	return rf
 }
