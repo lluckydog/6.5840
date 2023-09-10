@@ -304,8 +304,8 @@ func (rf *Raft) SendInstallSnapshot(server int, args *InstallSnapshotArgs, once 
 			return ok
 		} else {
 			DPrintf("[%v]: update next index & update index for %v", rf.me, server)
-			rf.nextIndex[server] = args.LastIncludedIndex + 1
 			rf.matchIndex[server] = args.LastIncludedIndex
+			rf.nextIndex[server] = args.LastIncludedIndex + 1
 		}
 
 		base := rf.logs[0].Index
@@ -600,12 +600,13 @@ func (rf *Raft) startAppendEntries() {
 			var args2 InstallSnapshotArgs
 			isInstall := false
 			if rf.matchIndex[i] >= rf.lastIncludedIndex {
+				DPrintf("[%v]: matchindex %v, base %v, logs %v,", rf.me, rf.matchIndex[i], base, rf.logs)
 				args = AppendEntriesArgs{
 					Term:         rf.currentTerm,
 					LeaderID:     rf.me,
 					PrevLogIndex: rf.logs[rf.matchIndex[i]-base].Index,
 					PrevLogTerm:  rf.logs[rf.matchIndex[i]-base].Term,
-					Entries:      rf.logs[rf.nextIndex[i]-base:],
+					Entries:      rf.logs[(rf.matchIndex[i] - base + 1):],
 					LeaderCommit: rf.commitIndex,
 				}
 			} else {
@@ -641,7 +642,7 @@ func (rf *Raft) startAppendEntries() {
 						b := rf.logs[0].Index
 						if args.Term == rf.currentTerm && rf.currenState == LEADER {
 							if reply.Success {
-								DPrintf("[%v]: appendEntries success from %v", rf.me, i)
+								//DPrintf("[%v]: appendEntries success from %v", rf.me, i)
 								if len(args.Entries) > 0 {
 									rf.matchIndex[i] = args.Entries[len(args.Entries)-1].Index
 									rf.nextIndex[i] = args.Entries[len(args.Entries)-1].Index + 1
@@ -739,6 +740,12 @@ func (rf *Raft) startElect() {
 						if *votes >= len(rf.peers)/2 {
 							once.Do(func() {
 								rf.currenState = LEADER
+								lastIndex := rf.logs[len(rf.logs)-1].Index
+								for j := 0; j < len(rf.peers); j++ {
+									rf.matchIndex[j] = lastIndex
+									rf.nextIndex[j] = lastIndex + 1
+								}
+
 								DPrintf("[%v]: Term %v become the leader", rf.me, rf.currentTerm)
 							})
 						}
